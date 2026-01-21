@@ -1,0 +1,247 @@
+name: Shared CI/CD for NestJS Monorepos
+
+on:
+  workflow_call:
+    inputs:
+      s3-bucket-name: { required: true, type: string }
+      application-name: { required: true, type: string }
+      application-port: { required: true, type: number }
+      aws-region: { required: false, type: string, default: "eu-central-1" }
+      # JSON array: [{"secret":"name","path":"apps/api"},{"secret":"name","path":"."}]
+      secrets: { required: true, type: string }
+      ec2-app-tag: { required: true, type: string }
+      ec2-name: { required: false, type: string }
+      healthcheck-enabled: { required: false, type: boolean, default: false }
+      healthcheck-path: { required: false, type: string, default: "/health" }
+      app-ref: { required: false, type: string }
+      root-dir: { required: false, type: string, default: "." }
+    secrets:
+      aws-access-key-id: { required: true }
+      aws-secret-access-key: { required: true }
+
+jobs:
+  upload-shared-files:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Shared Repository
+        uses: actions/checkout@v4
+        with:
+          repository: apekksu/shared-nest-monorepo
+          ref: main
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.aws-access-key-id }}
+          aws-secret-access-key: ${{ secrets.aws-secret-access-key }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Upload deploy script to S3
+        run: aws s3 cp ./scripts/deploy-monorepo.sh s3://${{ inputs.s3-bucket-name }}/scripts/deploy-monorepo.sh
+
+  build-and-deploy:
+    if: ${{ github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip ci]') }}
+    needs: upload-shared-files
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Application Repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.app-ref || github.ref_name }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.aws-access-key-id }}
+          aws-secret-access-key: ${{ secrets.aws-secret-access-key }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.12.0"
+
+      - name: Install dependencies
+        working-directory: ${{ inputs.root-dir || '.' }}
+        run: npm ci
+
+      - name: Create .env files from secrets
+        working-directory: ${{ inputs.root-dir || '.' }}
+        run: |
+          echo '${{ inputs.secrets }}' | jq -c '.[]' | while read -r item; do
+            secret=$(echo "$item" | jq -r '.secret')
+            envpath=$(echo "$item" | jq -r '.path')
+            echo "Fetching secret '$secret' for path '$envpath'"
+            mkdir -p "$envpath"
+            aws secretsmanager get-secret-value --secret-id "$secret" \
+              --query SecretString --output text \
+              | jq -r 'to_entries | .[] | "\(.key)=\(.value)"' > "$envpath/.env"
+            chmod 600 "$envpath/.env"
+            echo "Created $envpath/.env from secret $secret"
+          done
+
+      - name: Build
+        working-directory: ${{ inputs.root-dir || '.' }}
+        env:
+          NODE_OPTIONS: "--max-old-space-size=4096"
+        run: npm run build
+
+      - name: Prune to production deps
+        working-directory: ${{ inputs.root-dir || '.' }}
+        run: npm prune --omit=dev
+
+      - name: Package artifact
+        working-directory: ${{ inputs.root-dir || '.' }}
+        run: |
+          extra_ts=""
+          if ls tsconfig*.json >/dev/null 2>&1; then
+            extra_ts="$(ls tsconfig*.json)"
+            echo "Including tsconfig files in artifact: $extra_ts"
+          else
+            echo "No tsconfig*.json files found in $(pwd), skipping."
+          fi
+
+          # Find all .env files created by secrets step
+          env_files=$(find . -name ".env" -type f 2>/dev/null || true)
+          if [[ -n "$env_files" ]]; then
+            echo "Including .env files in artifact:"
+            echo "$env_files"
+          fi
+
+          zip -r ${{ inputs.application-name }}.zip \
+            dist package.json package-lock.json node_modules apps packages turbo.json $extra_ts $env_files
+
+          echo "== zip contents (head) =="
+          unzip -l "${{ inputs.application-name }}.zip" | sed -n '1,200p'
+          unzip -l "${{ inputs.application-name }}.zip" \
+            | awk '{print $NF}' \
+            | grep -E '^dist/(src/)?main\.js$' \
+            || echo "Entry not found (ok if framework differs)."
+
+      - name: Upload artifact to S3
+        working-directory: ${{ inputs.root-dir || '.' }}
+        run: aws s3 cp --only-show-errors ${{ inputs.application-name }}.zip s3://${{ inputs.s3-bucket-name }}/${{ inputs.application-name }}/
+
+      - name: Resolve target EC2
+        shell: bash
+        run: |
+          set -euo pipefail
+          export AWS_PAGER=""
+          if [[ -n "${{ inputs.ec2-name }}" ]]; then
+            FILTERS=( "Name=tag:Name,Values=${{ inputs.ec2-name }}" "Name=instance-state-name,Values=running" )
+          else
+            FILTERS=( "Name=tag:App,Values=${{ inputs.ec2-app-tag }}" "Name=instance-state-name,Values=running" )
+          fi
+          mapfile -t IDS < <(aws ec2 describe-instances --filters "${FILTERS[@]}" --query 'Reservations[].Instances[].InstanceId' --output text | tr '\t' '\n' | sed '/^$/d')
+          (( ${#IDS[@]} == 1 )) || { echo "Need exactly 1 instance, got ${#IDS[@]}"; exit 1; }
+          IID="${IDS[0]}"
+          IP=$(aws ec2 describe-instances --instance-ids "$IID" --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          echo "EC2_INSTANCE_ID=$IID" >> "$GITHUB_ENV"
+          echo "EC2_PUBLIC_IP=${IP:-}" >> "$GITHUB_ENV"
+
+      - name: Preflight (S3 + Secrets + artifact)
+        shell: bash
+        run: |
+          aws s3 ls "s3://${{ inputs.s3-bucket-name }}/scripts/deploy-monorepo.sh" >/dev/null
+          aws s3 ls "s3://${{ inputs.s3-bucket-name }}/${{ inputs.application-name }}/${{ inputs.application-name }}.zip" >/dev/null
+          # Validate all secrets exist
+          echo '${{ inputs.secrets }}' | jq -c '.[]' | while read -r item; do
+            secret=$(echo "$item" | jq -r '.secret')
+            echo "Validating secret: $secret"
+            aws secretsmanager describe-secret --secret-id "$secret" >/dev/null
+          done
+
+      - name: Deploy via SSM
+        shell: bash
+        run: |
+          SECRETS_JSON='${{ inputs.secrets }}'
+          CMDS_JSON=$(
+            printf '%s\n' \
+              "bash -lc 'echo ==== diag ====; id; whoami; uname -a; aws --version || true; node -v || true; npm -v || true; sudo -u ubuntu -H which pm2 || true; sudo -u ubuntu -H pm2 -v || true'" \
+              "aws s3 cp s3://${{ inputs.s3-bucket-name }}/scripts/deploy-monorepo.sh /tmp/deploy-monorepo.sh" \
+              "chmod +x /tmp/deploy-monorepo.sh" \
+              "bash -lc 'command -v unzip >/dev/null || (sudo apt-get update -y && sudo apt-get install -y unzip jq)'" \
+              "bash -lc 'command -v pm2 >/dev/null 2>&1 || npm i -g pm2'" \
+              "bash -lc 'NO_TEE=1 /tmp/deploy-monorepo.sh \"${{ inputs.application-name }}\" \"${{ inputs.application-port }}\" \"${{ inputs.s3-bucket-name }}\" \"${SECRETS_JSON}\"'" \
+            | jq -R . | jq -s '{commands: .}'
+          )
+          CID=$(aws ssm send-command \
+            --instance-ids "${{ env.EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "$CMDS_JSON" \
+            --cloud-watch-output-config CloudWatchOutputEnabled=true,CloudWatchLogGroupName="/aws/ssm/RunCommand" \
+            --timeout-seconds 1800 --region ${{ inputs.aws-region }} \
+            --comment "deploy ${{ inputs.application-name }} run $GITHUB_RUN_ID" \
+            --query "Command.CommandId" --output text)
+          echo "COMMAND_ID=$CID" >> "$GITHUB_ENV"
+
+      - name: Wait + dump SSM output
+        shell: bash
+        run: |
+          for i in {1..60}; do
+            OUT=$(aws ssm get-command-invocation --command-id "${{ env.COMMAND_ID }}" --instance-id "${{ env.EC2_INSTANCE_ID }}" --region ${{ inputs.aws-region }} --output json)
+            ST=$(jq -r '.Status' <<<"$OUT")
+            echo "SSM status: $ST"
+            [[ "$ST" =~ ^(InProgress|Pending|Delayed)$ ]] && sleep 5 && continue
+            echo "----- STDOUT -----"; jq -r '.StandardOutputContent' <<<"$OUT" || true
+            echo "----- STDERR -----"; jq -r '.StandardErrorContent'  <<<"$OUT" || true
+            [[ "$ST" == "Success" ]] && exit 0 || exit 1
+          done
+          echo "Timed out"; exit 1
+
+      - name: Health (local via SSM)
+        if: ${{ inputs.healthcheck-enabled }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          CMDS_JSON=$(printf '%s\n' "bash -lc 'set -e
+            port=${{ inputs.application-port }}
+            hp=\${HEALTH_PATH:-${{ inputs.healthcheck-path }}}
+            for i in {1..40}; do
+              code=\$(curl -s -o /dev/null -w \"%{http_code}\" http://127.0.0.1:\$port\"\$hp\" || true)
+              echo LOCAL_HTTP \$code
+              ss -H -lntp | grep -q \":\$port \" && exit 0
+              case \"\$code\" in 2*|3*) exit 0;; esac
+              sleep 3
+            done
+            exit 1'" | jq -R . | jq -s '{commands: .}')
+          CID=$(aws ssm send-command --instance-ids "${{ env.EC2_INSTANCE_ID }}" --document-name "AWS-RunShellScript" --parameters "$CMDS_JSON" --region ${{ inputs.aws-region }} --query "Command.CommandId" --output text)
+          aws ssm wait command-executed --command-id "$CID" --instance-id "${{ env.EC2_INSTANCE_ID }}" --region ${{ inputs.aws-region }} || true
+          aws ssm get-command-invocation --command-id "$CID" --instance-id "${{ env.EC2_INSTANCE_ID }}" --region ${{ inputs.aws-region }} --output text || true
+
+      - name: Health (public, best-effort)
+        if: always()
+        continue-on-error: true
+        run: |
+          for i in {1..20}; do
+            code=$(curl -sS --connect-timeout 3 --max-time 5 -o /dev/null -w '%{http_code}' "http://${{ env.EC2_PUBLIC_IP }}:${{ inputs.application-port }}${{ inputs.healthcheck-path }}" || true)
+            echo "PUBLIC_HTTP $code"
+            case "$code" in 2*|3*|404) exit 0;; esac
+            sleep 3
+          done
+          echo "Public probe saw no 2xx/3xx/404 — likely Nginx/HTTPS/SG."
+
+      - name: Fetch remote logs (best-effort)
+        if: always()
+        continue-on-error: true
+        run: |
+          cat > log_params.json <<'JSON'
+          { "commands": [
+              "echo '===== /home/ubuntu/deploy_script.log (tail -300) ====='",
+              "sudo tail -n 300 /home/ubuntu/deploy_script.log || true",
+              "echo", "echo '===== pm2 list ====='", "sudo -u ubuntu pm2 list || true",
+              "echo", "echo '===== cloud-init-output.log (tail -100) ====='",
+              "sudo tail -n 100 /var/log/cloud-init-output.log || true",
+              "echo", "echo '===== listeners (ss) ====='", "sudo ss -lntp | sed -n '1,200p' || true",
+              "echo", "echo '===== pm2 app logs (last 200) ====='",
+              "sudo -u ubuntu pm2 logs ${{ inputs.application-name }}-${{ inputs.application-port }} --lines 200 --nostream || true"
+            ] }
+          JSON
+          CID=$(aws ssm send-command --instance-ids "${{ env.EC2_INSTANCE_ID }}" --document-name "AWS-RunShellScript" --parameters file://log_params.json --region ${{ inputs.aws-region }} --query "Command.CommandId" --output text)
+          aws ssm wait command-executed --command-id "$CID" --instance-id "${{ env.EC2_INSTANCE_ID }}" --region ${{ inputs.aws-region }} || true
+          aws ssm get-command-invocation --command-id "$CID" --instance-id "${{ env.EC2_INSTANCE_ID }}" --region ${{ inputs.aws-region }} --output text || true
+
+      - name: Done
+        run: |
+          echo "Deployment completed."
+          echo "Application is (internally) on http://127.0.0.1:${{ inputs.application-port }}/"
