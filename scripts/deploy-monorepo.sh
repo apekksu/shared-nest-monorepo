@@ -5,13 +5,24 @@ export AWS_PAGER=""
 umask 027
 
 export HOME=/home/ubuntu
+
+decode_argument() {
+  local value="$1"
+
+  if [[ "$value" == base64:* ]]; then
+    printf '%s' "${value#base64:}" | base64 -d
+  else
+    printf '%s' "$value"
+  fi
+}
+
 APPLICATION_NAME="$1"
 APPLICATION_PORT="$2"
 S3_BUCKET_NAME="$3"
-SECRETS_JSON="$4"
+SECRETS_JSON="$(decode_argument "$4")"
 HEALTHCHECK_PATH="${5:-/}"
 HEALTHCHECK_ENABLED="${6:-false}"
-CANARY_COMMAND="${7:-}"
+CANARY_COMMAND="$(decode_argument "${7:-}")"
 
 PROCESS_NAME="${APPLICATION_NAME}-${APPLICATION_PORT}"
 APP_DIR="/home/ubuntu/${APPLICATION_NAME}"
