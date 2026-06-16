@@ -13,6 +13,7 @@ on:
       ec2-name: { required: false, type: string }
       healthcheck-enabled: { required: false, type: boolean, default: false }
       healthcheck-path: { required: false, type: string, default: "/health" }
+      canary-command: { required: false, type: string, default: "" }
       app-ref: { required: false, type: string }
       root-dir: { required: false, type: string, default: "." }
     secrets:
@@ -43,6 +44,9 @@ jobs:
     if: ${{ github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip ci]') }}
     needs: upload-shared-files
     runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-${{ github.repository }}-${{ inputs.application-name }}-${{ inputs.application-port }}
+      cancel-in-progress: true
     steps:
       - name: Checkout Application Repository
         uses: actions/checkout@v4
@@ -93,6 +97,7 @@ jobs:
       - name: Package artifact
         working-directory: ${{ inputs.root-dir || '.' }}
         run: |
+          zip_name="${{ inputs.application-name }}.zip"
           extra_ts=""
           if ls tsconfig*.json >/dev/null 2>&1; then
             extra_ts="$(ls tsconfig*.json)"
@@ -101,19 +106,30 @@ jobs:
             echo "No tsconfig*.json files found in $(pwd), skipping."
           fi
 
-          # Find all .env files created by secrets step
+          # Find all .env files created by the secrets step
           env_files=$(find . -name ".env" -type f 2>/dev/null || true)
           if [[ -n "$env_files" ]]; then
             echo "Including .env files in artifact:"
             echo "$env_files"
           fi
 
-          zip -r ${{ inputs.application-name }}.zip \
-            dist package.json package-lock.json node_modules apps packages turbo.json $extra_ts $env_files
+          zip -yr "$zip_name" \
+            dist package.json package-lock.json node_modules apps packages turbo.json $extra_ts $env_files \
+            -x "apps/*/node_modules/*" \
+            -x "packages/*/node_modules/*" \
+            -x "apps/*/.turbo/*" \
+            -x "packages/*/.turbo/*"
 
           echo "== zip contents (head) =="
-          unzip -l "${{ inputs.application-name }}.zip" | sed -n '1,200p'
-          unzip -l "${{ inputs.application-name }}.zip" \
+          unzip -l "$zip_name" | sed -n '1,200p'
+          echo "== zip size =="
+          du -h "$zip_name"
+          echo "== nested workspace node_modules check =="
+          if unzip -l "$zip_name" | awk '{print $NF}' | grep -E '^(apps|packages)/[^/]+/node_modules/'; then
+            echo "ERROR: artifact contains nested workspace node_modules."
+            exit 1
+          fi
+          unzip -l "$zip_name" \
             | awk '{print $NF}' \
             | grep -E '^dist/(src/)?main\.js$' \
             || echo "Entry not found (ok if framework differs)."
@@ -162,7 +178,7 @@ jobs:
               "chmod +x /tmp/deploy-monorepo.sh" \
               "bash -lc 'command -v unzip >/dev/null || (sudo apt-get update -y && sudo apt-get install -y unzip jq)'" \
               "bash -lc 'command -v pm2 >/dev/null 2>&1 || npm i -g pm2'" \
-              "bash -lc 'NO_TEE=1 /tmp/deploy-monorepo.sh \"${{ inputs.application-name }}\" \"${{ inputs.application-port }}\" \"${{ inputs.s3-bucket-name }}\" \"${SECRETS_JSON}\"'" \
+              "bash -lc 'NO_TEE=1 /tmp/deploy-monorepo.sh \"${{ inputs.application-name }}\" \"${{ inputs.application-port }}\" \"${{ inputs.s3-bucket-name }}\" \"${SECRETS_JSON}\" \"${{ inputs.healthcheck-path }}\" \"${{ inputs.healthcheck-enabled }}\" \"${{ inputs.canary-command }}\"'" \
             | jq -R . | jq -s '{commands: .}'
           )
           CID=$(aws ssm send-command \
