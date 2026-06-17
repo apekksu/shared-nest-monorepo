@@ -23,6 +23,7 @@ SECRETS_JSON="$(decode_argument "$4")"
 HEALTHCHECK_PATH="${5:-/}"
 HEALTHCHECK_ENABLED="${6:-false}"
 CANARY_COMMAND="$(decode_argument "${7:-}")"
+START_COMMAND="$(decode_argument "${8:-}")"
 
 PROCESS_NAME="${APPLICATION_NAME}-${APPLICATION_PORT}"
 APP_DIR="/home/ubuntu/${APPLICATION_NAME}"
@@ -153,11 +154,19 @@ stop_pm2() {
 
 start_pm2() {
   local cwd="$1"
-  sudo -u ubuntu bash -lc \
-    "export PORT='$APPLICATION_PORT' APPLICATION_PORT='$APPLICATION_PORT' NODE_ENV=production; \
-     pm2 delete '$PROCESS_NAME' >/dev/null 2>&1 || true; \
-     pm2 start npm --name '$PROCESS_NAME' --cwd '$cwd' -- start --update-env; \
-     pm2 save"
+  if [[ -n "$START_COMMAND" ]]; then
+    sudo -u ubuntu bash -lc \
+      "export PORT='$APPLICATION_PORT' APPLICATION_PORT='$APPLICATION_PORT' NODE_ENV=production; \
+       pm2 delete '$PROCESS_NAME' >/dev/null 2>&1 || true; \
+       pm2 start bash --name '$PROCESS_NAME' --cwd '$cwd' -- -lc '$START_COMMAND'; \
+       pm2 save"
+  else
+    sudo -u ubuntu bash -lc \
+      "export PORT='$APPLICATION_PORT' APPLICATION_PORT='$APPLICATION_PORT' NODE_ENV=production; \
+       pm2 delete '$PROCESS_NAME' >/dev/null 2>&1 || true; \
+       pm2 start npm --name '$PROCESS_NAME' --cwd '$cwd' -- start --update-env; \
+       pm2 save"
+  fi
 }
 
 rollback_previous_release() {
@@ -298,7 +307,11 @@ fi
 mv "$RELEASE_DIR" "$APP_DIR"
 chown -R ubuntu:ubuntu "$APP_DIR"
 
-echo "Starting application via PM2 (npm start) with APPLICATION_PORT=$APPLICATION_PORT"
+if [[ -n "$START_COMMAND" ]]; then
+  echo "Starting application via PM2 ($START_COMMAND) with APPLICATION_PORT=$APPLICATION_PORT"
+else
+  echo "Starting application via PM2 (npm start) with APPLICATION_PORT=$APPLICATION_PORT"
+fi
 if ! start_pm2 "$APP_DIR"; then
   echo "ERROR: PM2 start failed."
   rollback_previous_release || true
